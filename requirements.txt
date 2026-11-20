@@ -1,0 +1,13 @@
+streamlit==1.67.0
+streamlit-folium
+folium
+pandas
+numpy
+plotly
+openpyxl
+scikit-learn
+scipy
+reportlab
+Pillow
+requests
+matplotlib
