@@ -496,7 +496,7 @@ def optimize_shared_control_placement(plan_df, radius_m):
     return pd.DataFrame(rows)
 
 
-def build_engineering_pdf(report_lines, quality=None, engineering_df=None, optimized_df=None, performance_df=None, report_loc=None, pm_fraction=None, planning_radius=None, map_image_bytes=None):
+def build_engineering_pdf(report_lines, quality=None, engineering_df=None, optimized_df=None, performance_df=None, report_loc=None, pm_fraction=None, planning_radius=None, map_image_bytes=None, wind_summary=None, planning_zone=None, receptors=None):
     """Create a compact 2–3 page engineering solution PDF with a real map basemap when available."""
     try:
         from reportlab.lib import colors
@@ -532,8 +532,22 @@ def build_engineering_pdf(report_lines, quality=None, engineering_df=None, optim
                 return None
 
             width, height = 1100, 650
-            lat_min, lat_max = float(pts.Latitude.min()), float(pts.Latitude.max())
-            lon_min, lon_max = float(pts.Longitude.min()), float(pts.Longitude.max())
+            # Expand report-map bounds so seasonal wind endpoints and the preferred
+            # planning zone are visible instead of being cropped outside the mine footprint.
+            bound_lats=pts['Latitude'].astype(float).tolist(); bound_lons=pts['Longitude'].astype(float).tolist()
+            centre_lat0=float(pts.Latitude.mean()); centre_lon0=float(pts.Longitude.mean())
+            if wind_summary:
+                for _w in wind_summary:
+                    try:
+                        _ep=destination_point(centre_lat0,centre_lon0,float(_w['to_bearing']),float(_w['distance_m']))
+                        bound_lats.append(float(_ep[0])); bound_lons.append(float(_ep[1]))
+                    except Exception: pass
+            if planning_zone:
+                try:
+                    bound_lats.append(float(planning_zone['Latitude'])); bound_lons.append(float(planning_zone['Longitude']))
+                except Exception: pass
+            lat_min, lat_max = min(bound_lats), max(bound_lats)
+            lon_min, lon_max = min(bound_lons), max(bound_lons)
             lat_c, lon_c = (lat_min+lat_max)/2, (lon_min+lon_max)/2
 
             # Fit the map tightly to the monitoring locations.  The previous
@@ -594,8 +608,11 @@ def build_engineering_pdf(report_lines, quality=None, engineering_df=None, optim
             cx,cy=txc*256,tyc*256
             colors={'red':'#dc2626','orange':'#d97706','green':'#16a34a'}
             control_lookup={}
+            activity_lookup={}
             if engineering_df is not None and len(engineering_df):
                 control_lookup=dict(zip(engineering_df['Location'].astype(str), engineering_df['Primary_Control'].astype(str)))
+                if 'Activity' in engineering_df.columns:
+                    activity_lookup=dict(zip(engineering_df['Location'].astype(str), engineering_df['Activity'].astype(str)))
 
             for _,rr in pts.iterrows():
                 xw,yw=world_xy(float(rr.Latitude),float(rr.Longitude))
@@ -606,13 +623,42 @@ def build_engineering_pdf(report_lines, quality=None, engineering_df=None, optim
                 draw.ellipse((x-9,y-9,x+9,y+9),fill=c,outline='white',width=3)
                 loc=str(rr.get('Location','Site'))
                 ctl=control_lookup.get(loc,'')
-                label=loc if not ctl else f'{loc} — {ctl}'
+                activity=activity_lookup.get(loc, str(rr.get('Activity','Not recorded')))
+                source_label=f'{activity} dust source' if activity and activity not in ['Not recorded','nan','None'] else 'Monitored dust site'
+                label=f'{loc} | {source_label}' if not ctl else f'{loc} | {source_label} | {ctl}'
                 # Readable white callout behind each label.
                 box=draw.textbbox((0,0),label,font=font)
                 tw,th=box[2]-box[0],box[3]-box[1]
                 tx=min(max(x+13,4),max(4,width-tw-10)); ty=min(max(y-th//2,4),height-th-8)
                 draw.rounded_rectangle((tx-4,ty-3,tx+tw+4,ty+th+3),radius=4,fill=(255,255,255,225),outline='#cbd5e1')
                 draw.text((tx,ty),label,fill='#111827',font=font)
+
+            # Seasonal wind / receptor planning overlay for the report.
+            if receptors is not None and len(receptors):
+                for _,rx in receptors.iterrows():
+                    try:
+                        xw,yw=world_xy(float(rx.Latitude),float(rx.Longitude)); x=int(width/2+(xw-cx)); y=int(height/2+(yw-cy))
+                        if 0<=x<width and 0<=y<height:
+                            draw.rectangle((x-6,y-6,x+6,y+6),fill='#2563eb',outline='white',width=2)
+                    except Exception: pass
+            if wind_summary:
+                centre_lat=float(pts.Latitude.mean()); centre_lon=float(pts.Longitude.mean())
+                x0w,y0w=world_xy(centre_lat,centre_lon); sx=int(width/2+(x0w-cx)); sy=int(height/2+(y0w-cy))
+                wind_cols=['#38bdf8','#f59e0b','#22c55e','#a855f7']
+                for i,w in enumerate(wind_summary):
+                    try:
+                        end=destination_point(centre_lat,centre_lon,float(w['to_bearing']),float(w['distance_m']))
+                        exw,eyw=world_xy(*end); ex=int(width/2+(exw-cx)); ey=int(height/2+(eyw-cy))
+                        col=wind_cols[i%len(wind_cols)]
+                        draw.line((sx,sy,ex,ey),fill=col,width=6)
+                        draw.ellipse((ex-7,ey-7,ex+7,ey+7),fill=col,outline='white',width=2)
+                    except Exception: pass
+            if planning_zone:
+                try:
+                    zxw,zyw=world_xy(float(planning_zone['Latitude']),float(planning_zone['Longitude'])); zx=int(width/2+(zxw-cx)); zy=int(height/2+(zyw-cy))
+                    draw.ellipse((zx-17,zy-17,zx+17,zy+17),outline='#16a34a',width=5)
+                    draw.text((zx+20,zy-10),'Preferred lower-exposure planning zone',fill='#065f46',font=font_b)
+                except Exception: pass
 
             # Compact legend.
             legend=[('Higher priority','#dc2626'),('Moderate priority','#d97706'),('Lower priority','#16a34a')]
@@ -635,10 +681,14 @@ def build_engineering_pdf(report_lines, quality=None, engineering_df=None, optim
     styles.add(ParagraphStyle(name='RS',parent=styles['BodyText'],fontSize=7.2,leading=9.5,textColor=colors.HexColor('#64748b')))
     story=[]
 
+    def pdf_cell(value, style=None):
+        """Wrap long table text so report columns never overlap."""
+        return Paragraph(esc(value), style or styles['RS'])
+
     # PAGE 1 — finding and solution
     story += [Paragraph('Mine Dust Evaluation — Engineering Solution Report',styles['RTitle']),
               Paragraph('Performance Evaluation of Dust Control Devices in Opencast Coal Mines',styles['RB']),
-              Paragraph(f"Generated {datetime.now().strftime('%d %B %Y')} | Selected fraction: {esc(pm_fraction or 'N/A')}",styles['RS']),Spacer(1,3*mm),
+              Paragraph(f"Generated {datetime.now().strftime('%d %B %Y')} | Selected fraction: {esc(pm_display_name(pm_fraction or 'N/A'))}",styles['RS']),Spacer(1,3*mm),
               Paragraph('1. Key finding and engineering response',styles['RH'])]
     if engineering_df is not None and len(engineering_df):
         ranked=engineering_df.sort_values('Median_PM',ascending=False)
@@ -646,7 +696,7 @@ def build_engineering_pdf(report_lines, quality=None, engineering_df=None, optim
         story.append(Paragraph(f"The highest spatial priority in the uploaded dataset is <b>{esc(top['Location'])}</b> ({esc(top['Activity'])}), with median {esc(top['PM_Fraction'])} = <b>{esc(top['Median_PM'])}</b>. This is a within-dataset priority, not a regulatory safe/unsafe classification.",styles['RB']))
         story.append(Paragraph(f"Primary engineering response proposed for this location: <b>{esc(top['Primary_Control'])}</b>. {esc(top['Why_Proposed'])}",styles['RB']))
         compact=ranked[['Location','Activity','Relative_Priority','Primary_Control']].head(8).copy()
-        data=[['Location','Activity','Priority','Proposed solution']]+compact.astype(str).values.tolist()
+        data=[[pdf_cell('Location'),pdf_cell('Activity'),pdf_cell('Priority'),pdf_cell('Proposed solution')]] + [[pdf_cell(v) for v in row] for row in compact.astype(str).values.tolist()]
         tbl=Table(data,colWidths=[34*mm,27*mm,34*mm,82*mm],repeatRows=1)
         tbl.setStyle(TableStyle([('BACKGROUND',(0,0),(-1,0),colors.HexColor('#111827')),('TEXTCOLOR',(0,0),(-1,0),colors.white),('FONTSIZE',(0,0),(-1,-1),7),('LEADING',(0,0),(-1,-1),8.5),('GRID',(0,0),(-1,-1),.25,colors.HexColor('#cbd5e1')),('VALIGN',(0,0),(-1,-1),'TOP'),('ROWBACKGROUNDS',(0,1),(-1,-1),[colors.white,colors.HexColor('#f8fafc')]),('LEFTPADDING',(0,0),(-1,-1),3),('RIGHTPADDING',(0,0),(-1,-1),3)]))
         story += [Spacer(1,2*mm),tbl]
@@ -662,13 +712,24 @@ def build_engineering_pdf(report_lines, quality=None, engineering_df=None, optim
         if mb:
             story.append(Image(mb,width=184*mm,height=114*mm))
             story.append(Spacer(1,2*mm))
-            story.append(Paragraph('Monitoring and proposed-control locations. Red/orange/green markers show higher/moderate/lower relative dust priority.',styles['RS']))
+            story.append(Paragraph('Monitoring dust sites are labelled with location, dust-generating activity/source and recommended control. Red/orange/green markers show higher/moderate/lower relative dust priority.',styles['RS']))
+            if wind_summary:
+                story.append(Spacer(1,3*mm)); story.append(Paragraph('Seasonal wind and settlement/receptor planning',styles['RH']))
+                wind_text=[]
+                for w in wind_summary:
+                    wind_text.append(f"{esc(w['season'])}: wind FROM {esc(w['from_dir'])} → potential dust transport TO {esc(w['to_dir'])}, visualized for {int(w['distance_m'])} m")
+                story.append(Paragraph('<br/>'.join(wind_text),styles['RB']))
+                if planning_zone:
+                    story.append(Paragraph(f"The comparative model identifies a <b>preferred lower-exposure planning zone</b> approximately <b>{planning_zone['Nearest_Dust_Source_m']:.0f} m</b> from the nearest monitored dust source. The map marks this zone in green. This is a dust/wind exposure shortlist only; final settlement, market, school or hospital siting requires statutory buffers, land, access, drainage, terrain and field/environmental assessment.",styles['RB']))
+                if receptors is not None and len(receptors):
+                    story.append(Paragraph(f"Existing sensitive receptors considered in the planning screen: <b>{len(receptors)}</b>. Blue square markers on the map represent receptor coordinates supplied in the project data.",styles['RB']))
+                story.append(Paragraph('Wind direction uses the meteorological FROM convention; the report maps the opposite downwind transport direction. The sector/distance is a planning visualization, not a Gaussian plume or certified dispersion prediction.',styles['RS']))
         else:
             story.append(Paragraph('Map service was unavailable while this PDF was generated. No substitute coordinate chart has been inserted.',styles['RB']))
         if engineering_df is not None and len(engineering_df):
-            map_controls=engineering_df[['Location','Primary_Control']].copy().head(9)
-            cdata=[['Location','Recommended control']]+map_controls.astype(str).values.tolist()
-            ctbl=Table(cdata,colWidths=[52*mm,125*mm],repeatRows=1)
+            map_controls=engineering_df[['Location','Activity','Primary_Control']].copy().head(9)
+            cdata=[[pdf_cell('Location'),pdf_cell('Dust source / activity'),pdf_cell('Recommended control')]] + [[pdf_cell(v) for v in row] for row in map_controls.astype(str).values.tolist()]
+            ctbl=Table(cdata,colWidths=[55*mm,38*mm,84*mm],repeatRows=1)
             ctbl.setStyle(TableStyle([('BACKGROUND',(0,0),(-1,0),colors.HexColor('#111827')),('TEXTCOLOR',(0,0),(-1,0),colors.white),('FONTSIZE',(0,0),(-1,-1),7),('LEADING',(0,0),(-1,-1),8.2),('GRID',(0,0),(-1,-1),.25,colors.HexColor('#cbd5e1')),('ROWBACKGROUNDS',(0,1),(-1,-1),[colors.white,colors.HexColor('#f8fafc')]),('VALIGN',(0,0),(-1,-1),'TOP')]))
             story += [Spacer(1,2*mm),ctbl]
 
@@ -678,7 +739,7 @@ def build_engineering_pdf(report_lines, quality=None, engineering_df=None, optim
         story.append(Paragraph('Predicted improvement if the recommended controls are implemented',styles['RB']))
         cols=['Location','Current_PM','Recommended_Control','Expected_Reduction_Percent','Predicted_PM_After_Control']
         d=performance_df[cols].dropna(subset=['Expected_Reduction_Percent']).head(8).copy().round(2)
-        data=[['Location','Current PM','Recommended control','Expected reduction %','Predicted PM after']]+d.astype(str).values.tolist()
+        data=[[pdf_cell('Location'),pdf_cell('Current PM'),pdf_cell('Recommended control'),pdf_cell('Expected reduction %'),pdf_cell('Predicted PM after')]] + [[pdf_cell(v) for v in row] for row in d.astype(str).values.tolist()]
         tbl=Table(data,colWidths=[28*mm,22*mm,70*mm,28*mm,29*mm],repeatRows=1)
         tbl.setStyle(TableStyle([('BACKGROUND',(0,0),(-1,0),colors.HexColor('#111827')),('TEXTCOLOR',(0,0),(-1,0),colors.white),('FONTSIZE',(0,0),(-1,-1),6.7),('GRID',(0,0),(-1,-1),.25,colors.HexColor('#cbd5e1')),('VALIGN',(0,0),(-1,-1),'TOP')]))
         story += [tbl,Spacer(1,2*mm)]
@@ -939,6 +1000,91 @@ def validate_workbook(uploaded_file):
 # DASHBOARD
 # ============================================================
 
+# ============================================================
+# SEASONAL WIND / RECEPTOR PLANNING HELPERS
+# ============================================================
+
+def pm_display_name(name):
+    """User-facing terminology; preserve raw TSP column internally."""
+    return "SPM" if str(name) == "TSP" else str(name)
+
+def government_reference_limit(pm_fraction):
+    """Automatic India government reference lines used for screening displays.
+    These are averaging-period standards, not instantaneous-reading compliance tests.
+    """
+    f=str(pm_fraction)
+    if f == "PM10":
+        return 100.0, "CPCB NAAQS — PM10, 24-hour (100 µg/m³)"
+    if f == "PM2.5":
+        return 60.0, "CPCB NAAQS — PM2.5, 24-hour (60 µg/m³)"
+    if f in ("TSP","SPM"):
+        return 500.0, "Environment (Protection) Rules — New Coal Mines SPM, 24-hour at prescribed downwind monitoring location (500 µg/m³)"
+    return None, "No directly corresponding automatic government particulate limit configured for this fraction"
+
+WIND_BEARINGS = {"N":0, "NE":45, "E":90, "SE":135, "S":180, "SW":225, "W":270, "NW":315}
+
+def destination_point(lat, lon, bearing_deg, distance_m):
+    R = 6371000.0
+    br = math.radians(float(bearing_deg))
+    lat1, lon1 = math.radians(float(lat)), math.radians(float(lon))
+    d = float(distance_m) / R
+    lat2 = math.asin(math.sin(lat1)*math.cos(d) + math.cos(lat1)*math.sin(d)*math.cos(br))
+    lon2 = lon1 + math.atan2(math.sin(br)*math.sin(d)*math.cos(lat1), math.cos(d)-math.sin(lat1)*math.sin(lat2))
+    return math.degrees(lat2), math.degrees(lon2)
+
+def haversine_m(lat1, lon1, lat2, lon2):
+    R=6371000.0
+    p1,p2=math.radians(float(lat1)),math.radians(float(lat2))
+    dp=math.radians(float(lat2)-float(lat1)); dl=math.radians(float(lon2)-float(lon1))
+    a=math.sin(dp/2)**2+math.cos(p1)*math.cos(p2)*math.sin(dl/2)**2
+    return 2*R*math.asin(min(1,math.sqrt(a)))
+
+def bearing_deg(lat1, lon1, lat2, lon2):
+    p1,p2=math.radians(float(lat1)),math.radians(float(lat2)); dl=math.radians(float(lon2)-float(lon1))
+    y=math.sin(dl)*math.cos(p2); x=math.cos(p1)*math.sin(p2)-math.sin(p1)*math.cos(p2)*math.cos(dl)
+    return (math.degrees(math.atan2(y,x))+360)%360
+
+def angular_difference(a,b):
+    return abs((float(a)-float(b)+180)%360-180)
+
+def add_wind_sector(map_obj, lat, lon, bearing, radius_m, half_angle=25, color="#38bdf8", label="Wind"):
+    end=destination_point(lat,lon,bearing,radius_m)
+    left=destination_point(lat,lon,bearing-half_angle,radius_m)
+    right=destination_point(lat,lon,bearing+half_angle,radius_m)
+    folium.Polygon([[lat,lon],list(left),list(end),list(right)], color=color, weight=2,
+                   fill=True, fill_color=color, fill_opacity=.13,
+                   tooltip=f"{label}: downwind planning sector").add_to(map_obj)
+    folium.PolyLine([[lat,lon],list(end)], color=color, weight=5, opacity=.9,
+                    tooltip=f"{label}: prevailing downwind direction").add_to(map_obj)
+    folium.Marker(list(end), tooltip=f"{label} → downwind", icon=folium.DivIcon(
+        html=f"<div style='font-size:25px;color:{color};font-weight:900;'>➤</div>"
+    )).add_to(map_obj)
+
+def planning_score(lat, lon, sources, seasonal_bearings, receptors, sector_half_angle=25):
+    """Relative lower-exposure planning score; higher is preferred. Not construction suitability."""
+    if len(sources)==0: return np.nan, {}
+    min_source=min(haversine_m(lat,lon,r.Latitude,r.Longitude) for r in sources.itertuples())
+    # proximity penalty emphasizes higher-priority dust sources
+    prox=0.0; downwind=0.0
+    for r in sources.itertuples():
+        d=max(haversine_m(r.Latitude,r.Longitude,lat,lon),50.0)
+        w={"Higher relative priority":3.0,"Moderate relative priority":2.0,"Lower relative priority":1.0}.get(r.Relative_Priority,1.0)
+        prox += w/(d/500.0+0.35)
+        bsrc=bearing_deg(r.Latitude,r.Longitude,lat,lon)
+        for wb in seasonal_bearings:
+            if angular_difference(bsrc,wb)<=sector_half_angle:
+                downwind += w/(d/500.0+0.35)
+    receptor_pen=0.0; min_receptor=np.nan
+    if receptors is not None and len(receptors):
+        ds=[haversine_m(lat,lon,float(rr.Latitude),float(rr.Longitude)) for rr in receptors.itertuples()]
+        min_receptor=min(ds) if ds else np.nan
+        # Avoid proposing future development directly on top of an existing sensitive receptor.
+        receptor_pen=sum(1.0/(max(d,50)/300.0+0.3) for d in ds)
+    raw = (min_source/1000.0)*2.2 - prox - 1.35*downwind - 0.15*receptor_pen
+    return raw,{"Nearest_Dust_Source_m":min_source,"Nearest_Existing_Receptor_m":min_receptor,
+                "Downwind_Exposure_Index":downwind,"Source_Proximity_Index":prox}
+
+
 if page == "🏠 Project Dashboard":
 
     st.header("Project Dashboard")
@@ -999,7 +1145,7 @@ if page == "🏠 Project Dashboard":
         dash_pm_options = [c for c in ["PM1","PM2.5","PM4","PM7","PM10","TSP"] if c in dust_dash.columns]
         if dash_pm_options:
             default_i = dash_pm_options.index("PM10") if "PM10" in dash_pm_options else 0
-            dash_fraction = st.selectbox("Dashboard PM fraction", dash_pm_options, index=default_i, key="dashboard_pm_fraction")
+            dash_fraction = st.selectbox("Dashboard PM fraction", dash_pm_options, index=default_i, key="dashboard_pm_fraction", format_func=pm_display_name)
             act = dust_dash[["Activity", dash_fraction]].copy()
             act[dash_fraction] = pd.to_numeric(act[dash_fraction], errors="coerce")
             act["Activity"] = act["Activity"].astype(str).str.strip()
@@ -1083,69 +1229,11 @@ elif page == "📥 Data & Validation":
 
     st.divider()
     st.subheader("Load Project Data")
-    standard_tab, raw_tab = st.tabs(["Standard Mine Dust Evaluation workbook", "Import original field files"])
-
-    with standard_tab:
-        uploaded_file = st.file_uploader("Upload project workbook", type=["xlsx"], key="standard_project_workbook")
-
-    with raw_tab:
-        st.caption("Use this for the original Aerocell PM DOCX, GPS DOCX and filter-paper Excel workbooks. The app standardizes them without inventing verified PM↔GPS or before/after relationships.")
-        pm_doc = st.file_uploader("Aerocell PM readings (DOCX)", type=["docx"], key="raw_pm_doc")
-        gps_doc = st.file_uploader("Aerocell GPS/location records (DOCX)", type=["docx"], key="raw_gps_doc")
-        filter_books = st.file_uploader("Filter-paper workbooks (XLSX) — select one or more", type=["xlsx"], accept_multiple_files=True, key="raw_filter_books")
-        if st.button("Load Original Field Data", type="primary", use_container_width=True):
-            if pm_doc is None or gps_doc is None:
-                light_notice("Upload both Aerocell DOCX files. Filter-paper workbooks are optional but recommended.", tone="warning")
-            else:
-                try:
-                    dust_raw=parse_aerocell_pm_docx(pm_doc)
-                    sites_raw=parse_gps_docx(gps_doc)
-                    dust_raw=infer_temporal_gps_candidates(dust_raw,sites_raw,tolerance_min=3)
-                    fps=[]
-                    for fb in (filter_books or []):
-                        q=parse_filter_workbook(fb,fb.name)
-                        if len(q): fps.append(q)
-                    filter_raw=pd.concat(fps,ignore_index=True) if fps else pd.DataFrame(columns=REQUIRED_STRUCTURE["Filter_Paper"])
-                    device_raw=pd.DataFrame(columns=REQUIRED_STRUCTURE["Device_Performance"]+["Before_After_Pair_Verified"])
-                    st.session_state.dust_data=dust_raw
-                    st.session_state.filter_data=filter_raw
-                    st.session_state.device_data=device_raw
-                    st.session_state.site_data=sites_raw
-                    st.session_state.validated=True
-                    st.session_state.raw_field_mode=True
-                    validation_row(f"Aerocell PM readings loaded — {len(dust_raw)} records",True)
-                    validation_row(f"GPS/site records loaded — {len(sites_raw)} records",True)
-                    validation_row(f"Filter-paper records loaded — {len(filter_raw)} records",True)
-                    linked=(dust_raw['GPS_Linkage_Status'].str.startswith('INFERRED')).sum()
-                    light_notice(f"{linked} PM readings have candidate GPS matches based only on time proximity. They remain explicitly marked INFERRED — VERIFY. No verified control before/after data was present in these raw files.",tone="info")
-                except Exception as e:
-                    light_notice(f"Raw field import could not be completed: {e}",tone="warning")
-
-    if st.session_state.get("raw_field_mode") and st.session_state.get("dust_data") is not None:
-        with st.expander("Engineering planning setup for raw field data", expanded=False):
-            st.caption("Optional. Candidate GPS matches are based on time proximity only. Use them for planning/visualization only after checking field notes; they are never relabelled as verified measurements.")
-            dplan=st.session_state.dust_data.copy()
-            candidates=sorted([x for x in dplan.get("Candidate_GPS_Location",pd.Series(dtype=str)).dropna().astype(str).unique() if x.strip()])
-            if candidates:
-                activity_options=["Not recorded","Background / Upwind","Haulage","Crushing","Loading","Drilling","Dumping","Stockpile","Workshop"]
-                assign=pd.DataFrame({"Location":candidates,"Activity":["Not recorded"]*len(candidates)})
-                edited=st.data_editor(assign,hide_index=True,use_container_width=True,column_config={"Activity":st.column_config.SelectboxColumn("Activity (only if known from field records)",options=activity_options)},disabled=["Location"],key="raw_activity_editor")
-                use_links=st.checkbox("Use the inferred time-matched GPS locations as a planning layer",value=False,key="use_inferred_links")
-                if st.button("Apply planning layer",key="apply_raw_planning"):
-                    if use_links:
-                        amap=dict(zip(edited["Location"],edited["Activity"]))
-                        mask=dplan["GPS_Linkage_Status"].astype(str).str.startswith("INFERRED")
-                        dplan.loc[mask,"Location"]=dplan.loc[mask,"Candidate_GPS_Location"]
-                        dplan.loc[mask,"Latitude"]=dplan.loc[mask,"Candidate_Latitude"]
-                        dplan.loc[mask,"Longitude"]=dplan.loc[mask,"Candidate_Longitude"]
-                        dplan.loc[mask,"Activity"]=dplan.loc[mask,"Location"].map(amap).fillna("Not recorded")
-                        dplan.loc[mask,"Data_Status"]="CALCULATED/INFERRED planning linkage — field verification required"
-                        st.session_state.dust_data=dplan
-                        validation_row("Planning layer applied. Inferred links remain labelled for verification.",True)
-                    else:
-                        light_notice("Enable the planning-layer checkbox before applying candidate GPS links.",tone="warning")
-            else:
-                light_notice("No PM/GPS timestamps were close enough for a candidate temporal link.",tone="info")
+    uploaded_file = st.file_uploader(
+        "Upload project workbook",
+        type=["xlsx"],
+        key="standard_project_workbook"
+    )
 
     if uploaded_file is not None:
 
@@ -1446,7 +1534,7 @@ elif page == "📈 Dust Analysis":
                 x_col = "Observation"
                 x_title = "Observation Sequence"
 
-            selected = st.multiselect("PM fractions to display", pm_cols, default=pm_cols)
+            selected = st.multiselect("PM fractions to display", pm_cols, default=[], format_func=pm_display_name)
             if not selected:
                 selected = pm_cols
 
@@ -1465,13 +1553,24 @@ elif page == "📈 Dust Analysis":
             c4.metric("PM fractions", len(pm_cols))
 
             st.subheader("PM Variation with Time")
+            # Government reference lines are shown automatically when a directly corresponding standard exists.
+            auto_limits=[]
+            for _f in selected:
+                _lim,_lab=government_reference_limit(_f)
+                if _lim is not None and (_lim,_lab) not in auto_limits:
+                    auto_limits.append((_lim,_lab))
+            if auto_limits:
+                st.caption("Red reference line(s) are applied automatically from the configured Indian government standards. Because these standards use specified averaging periods, individual instrument readings are a screening/reference comparison, not by themselves a legal non-compliance determination.")
             time_id_vars = list(dict.fromkeys([x_col, "Observation", "Time_Label"]))
             time_long = analysis.melt(id_vars=time_id_vars, value_vars=selected,
                                       var_name="PM Fraction", value_name="Measured Value")
+            time_long["PM Fraction"] = time_long["PM Fraction"].map(pm_display_name)
             fig = px.line(time_long, x=x_col, y="Measured Value", color="PM Fraction", markers=True,
                           title="Particulate Measurements Across the Monitoring Period",
                           hover_data=["Observation","Time_Label"])
             fig.update_layout(xaxis_title=x_title, yaxis_title="Measured Value (source unit not verified)")
+            for _lim,_lab in auto_limits:
+                fig.add_hline(y=_lim, line_color="red", line_width=3, line_dash="dash", annotation_text=_lab, annotation_position="top left")
             if x_col == "_Timestamp":
                 fig.update_xaxes(tickformat="%d %b\n%H:%M")
             st.plotly_chart(fig, use_container_width=True)
@@ -1482,6 +1581,9 @@ elif page == "📈 Dust Analysis":
                 fig = px.line(analysis, x=x_col, y="PM10", markers=True, title="PM10 Variation with Time",
                               hover_data=["Observation","Time_Label"])
                 fig.update_layout(xaxis_title=x_title, yaxis_title="PM10 (source unit not verified)")
+                _pm10_lim,_pm10_lab=government_reference_limit("PM10")
+                if _pm10_lim is not None:
+                    fig.add_hline(y=_pm10_lim, line_color="red", line_width=3, line_dash="dash", annotation_text=_pm10_lab, annotation_position="top left")
                 if x_col == "_Timestamp":
                     fig.update_xaxes(tickformat="%d %b\n%H:%M")
                 st.plotly_chart(fig, use_container_width=True)
@@ -1491,8 +1593,8 @@ elif page == "📈 Dust Analysis":
                 analysis["PM2.5_PM10_Ratio"] = np.where(analysis["PM10"]>0, analysis["PM2.5"]/analysis["PM10"], np.nan)
                 ratio_cols.append("PM2.5_PM10_Ratio")
             if {"PM10","TSP"}.issubset(analysis.columns):
-                analysis["PM10_TSP_Ratio"] = np.where(analysis["TSP"]>0, analysis["PM10"]/analysis["TSP"], np.nan)
-                ratio_cols.append("PM10_TSP_Ratio")
+                analysis["PM10_SPM_Ratio"] = np.where(analysis["TSP"]>0, analysis["PM10"]/analysis["TSP"], np.nan)
+                ratio_cols.append("PM10_SPM_Ratio")
             if ratio_cols:
                 st.subheader("Particle-Fraction Ratios Over Time")
                 ratio_id_vars = list(dict.fromkeys([x_col, "Observation", "Time_Label"]))
@@ -1503,7 +1605,7 @@ elif page == "📈 Dust Analysis":
                 st.plotly_chart(fig,use_container_width=True)
 
             st.subheader("Highest Observed Measurements")
-            rank_fraction = st.selectbox("Rank observations by", pm_cols, index=pm_cols.index("PM10") if "PM10" in pm_cols else 0)
+            rank_fraction = st.selectbox("Rank observations by", pm_cols, index=pm_cols.index("PM10") if "PM10" in pm_cols else 0, format_func=pm_display_name)
             show_cols=[c for c in ["Sample_ID","Date","Time","Location",rank_fraction] if c in analysis.columns]
             top=analysis.sort_values(rank_fraction,ascending=False).head(5)[show_cols].copy()
             st.dataframe(top,use_container_width=True,hide_index=True)
@@ -1706,6 +1808,7 @@ elif page == "🧪 Filter / Location Analysis":
         )
 
 
+
 # ============================================================
 # GIS
 # ============================================================
@@ -1736,7 +1839,7 @@ elif page == "🗺️ Spatial Dust Map":
             st.warning("No valid linked PM + GPS observations are available.")
         else:
             default_i = pm_options.index("PM10") if "PM10" in pm_options else 0
-            spatial_fraction = st.selectbox("PM fraction for spatial priority", pm_options, index=default_i)
+            spatial_fraction = st.selectbox("PM fraction for spatial priority", pm_options, index=default_i, format_func=pm_display_name)
             spatial[spatial_fraction] = pd.to_numeric(spatial[spatial_fraction], errors="coerce")
             spatial = spatial.dropna(subset=[spatial_fraction])
 
@@ -1781,7 +1884,7 @@ elif page == "🗺️ Spatial Dust Map":
                 <b>{r['Location']}</b><br><br>
                 <b>Activity:</b> {r['Activity']}<br>
                 <b>GPS:</b> {r['Latitude']:.6f}, {r['Longitude']:.6f}<br>
-                <b>PM fraction:</b> {spatial_fraction}<br>
+                <b>PM fraction:</b> {pm_display_name(spatial_fraction)}<br>
                 <b>Median:</b> {r['Median_PM']:.2f}<br>
                 <b>Maximum:</b> {r['Maximum_PM']:.2f}<br>
                 <b>Observations:</b> {int(r['Observations'])}<br>
@@ -1806,6 +1909,96 @@ elif page == "🗺️ Spatial Dust Map":
                 use_container_width=True, hide_index=True
             )
             st.caption("Priority is a within-dataset ranking; it is not a regulatory safe/unsafe classification.")
+
+            st.divider()
+            st.subheader("Seasonal Wind + Settlement / Sensitive-Receptor Planning")
+            st.caption("Planning aid: combines dust-source priority, prevailing wind direction and existing receptor coordinates. It estimates relative downwind exposure; it does not certify land as safe or suitable for construction.")
+
+            season_names=["Winter","Pre-monsoon / Summer","Monsoon","Post-monsoon"]
+            direction_options=["Not entered","N","NE","E","SE","S","SW","W","NW"]
+            wc1,wc2,wc3,wc4=st.columns(4)
+            wind_dirs={}
+            for col,season in zip([wc1,wc2,wc3,wc4],season_names):
+                wind_dirs[season]=col.selectbox(season, direction_options, key=f"wind_{season}", help="Enter the verified meteorological wind direction FROM which the wind blows. The app automatically shows dust transport in the opposite (downwind) direction.")
+            season_view=st.radio("Wind planning view", season_names+["All Seasons"], horizontal=True, key="wind_season_view")
+            dispersion_radius=st.slider("Wind dispersion planning distance (m)",100,5000,2000,100,key="wind_dispersion_radius",
+                                        help="Visualization/planning distance only; not a dispersion-model prediction.")
+
+            # Existing receptors can come from Site_Information when suitable columns exist; user can add/verify rows here.
+            receptor_seed=[]
+            if sites is not None and len(sites):
+                latc=next((c for c in ["Latitude","Lat"] if c in sites.columns),None)
+                lonc=next((c for c in ["Longitude","Lon","Lng"] if c in sites.columns),None)
+                typec=next((c for c in ["Receptor_Type","Site_Type","Type"] if c in sites.columns),None)
+                namec=next((c for c in ["Location","Name","Site"] if c in sites.columns),None)
+                if latc and lonc:
+                    for _,sr in sites.iterrows():
+                        typ=str(sr.get(typec,"Other")) if typec else "Other"
+                        if (typec is None) or any(k in typ.lower() for k in ["settlement","market","school","hospital","village","residential","receptor"]):
+                            receptor_seed.append({"Name":str(sr.get(namec,"Receptor")) if namec else "Receptor","Type":typ,
+                                                  "Latitude":sr.get(latc,np.nan),"Longitude":sr.get(lonc,np.nan)})
+            receptor_df=pd.DataFrame(receptor_seed,columns=["Name","Type","Latitude","Longitude"])
+            with st.expander("Existing settlements / markets / schools / hospitals (optional but recommended)"):
+                st.caption("Add or verify receptor coordinates. These are used only for relative exposure planning; no settlement is invented automatically.")
+                receptor_df=st.data_editor(receptor_df,num_rows="dynamic",use_container_width=True,key="receptor_editor",
+                                           column_config={"Type":st.column_config.SelectboxColumn("Type",options=["Settlement","Market","School","Hospital","Village","Residential","Other"])})
+            if len(receptor_df):
+                receptor_df["Latitude"]=pd.to_numeric(receptor_df["Latitude"],errors="coerce")
+                receptor_df["Longitude"]=pd.to_numeric(receptor_df["Longitude"],errors="coerce")
+                receptor_df=receptor_df.dropna(subset=["Latitude","Longitude"])
+                receptor_df=receptor_df[receptor_df["Latitude"].between(-90,90)&receptor_df["Longitude"].between(-180,180)]
+
+            active=[]
+            if season_view=="All Seasons":
+                active=[(sn,(WIND_BEARINGS[d]+180)%360) for sn,d in wind_dirs.items() if d in WIND_BEARINGS]
+            elif wind_dirs.get(season_view) in WIND_BEARINGS:
+                active=[(season_view,(WIND_BEARINGS[wind_dirs[season_view]]+180)%360)]
+
+            mw=folium.Map(location=[loc["Latitude"].mean(),loc["Longitude"].mean()],zoom_start=13,tiles=None,control_scale=True)
+            folium.TileLayer(tiles="https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}",attr="Esri World Imagery",name="Satellite").add_to(mw)
+            for _,r in loc.iterrows():
+                folium.CircleMarker([r.Latitude,r.Longitude],radius=8,color=r.Map_Color,fill=True,fill_color=r.Map_Color,fill_opacity=.85,
+                                    tooltip=f"Dust source/monitoring: {r.Location} — {r.Relative_Priority}").add_to(mw)
+            for _,rr in receptor_df.iterrows():
+                folium.Marker([rr.Latitude,rr.Longitude],tooltip=f"Existing receptor: {rr.Name} ({rr.Type})",
+                              icon=folium.Icon(color="blue",icon="home",prefix="fa")).add_to(mw)
+            if active:
+                centre_lat=float(loc.Latitude.mean()); centre_lon=float(loc.Longitude.mean())
+                palette=["#38bdf8","#f59e0b","#22c55e","#a855f7"]
+                for i,(sn,wb) in enumerate(active):
+                    add_wind_sector(mw,centre_lat,centre_lon,wb,dispersion_radius,25,palette[i%len(palette)],sn)
+
+                # Search a grid around the monitored mine footprint for a relative lower-exposure candidate.
+                lat_span=max(float(loc.Latitude.max()-loc.Latitude.min()),0.01); lon_span=max(float(loc.Longitude.max()-loc.Longitude.min()),0.01)
+                lats=np.linspace(float(loc.Latitude.min()-0.35*lat_span),float(loc.Latitude.max()+0.35*lat_span),23)
+                lons=np.linspace(float(loc.Longitude.min()-0.35*lon_span),float(loc.Longitude.max()+0.35*lon_span),23)
+                scored=[]; bearings=[b for _,b in active]
+                for la in lats:
+                    for lo in lons:
+                        score,meta=planning_score(la,lo,loc,bearings,receptor_df)
+                        scored.append((score,la,lo,meta))
+                scored=sorted(scored,key=lambda x:x[0],reverse=True)
+                best=scored[0] if scored else None
+                if best:
+                    score,bla,blo,meta=best
+                    folium.Circle([bla,blo],radius=300,color="#22c55e",fill=True,fill_color="#22c55e",fill_opacity=.16,weight=3,
+                                  tooltip="Preferred lower-exposure planning zone (relative model)").add_to(mw)
+                    pop=(f"<b>Preferred Lower-Exposure Planning Zone</b><br><b>Basis:</b> dust priority + configured seasonal wind + receptor coordinates<br>"
+                         f"<b>Nearest monitored dust source:</b> {meta['Nearest_Dust_Source_m']:.0f} m<br>"
+                         f"<b>Downwind exposure index:</b> {meta['Downwind_Exposure_Index']:.2f}<br>"
+                         f"<b>Status:</b> comparative planning output only — field/statutory assessment required")
+                    folium.Marker([bla,blo],tooltip="★ Preferred lower-exposure planning zone",popup=folium.Popup(pop,max_width=380),
+                                  icon=folium.Icon(color="green",icon="star",prefix="fa")).add_to(mw)
+                st_folium(mw,height=600,use_container_width=True,key="wind_receptor_planning_map")
+                if best:
+                    a,b,c=st.columns(3)
+                    a.metric("Configured seasons",len(active))
+                    b.metric("Nearest monitored dust source",f"{best[3]['Nearest_Dust_Source_m']:.0f} m")
+                    c.metric("Existing receptors considered",len(receptor_df))
+                    st.success("Green star/zone = comparatively lower modeled dust exposure for the selected seasonal scenario(s). Use it to shortlist an area, not as final construction approval.")
+            else:
+                st_folium(mw,height=600,use_container_width=True,key="wind_receptor_planning_map_empty")
+                st.info("Enter at least one verified seasonal prevailing downwind direction above. The app will then draw the dust-transport sector and calculate a preferred lower-exposure planning zone.")
 
             st.divider()
             st.subheader("Map 2 — Proposed Control Placement + Coverage Zone")
@@ -1859,7 +2052,7 @@ elif page == "🗺️ Spatial Dust Map":
                 <b>Location:</b> {r['Location']}<br>
                 <b>Activity:</b> {activity}<br>
                 <b>Priority:</b> {r['Relative_Priority']}<br>
-                <b>{spatial_fraction} median:</b> {r['Median_PM']:.2f}<br><br>
+                <b>{pm_display_name(spatial_fraction)} median:</b> {r['Median_PM']:.2f}<br><br>
                 <b>Primary control:</b> {primary}<br>
                 <b>Alternative:</b> {alternative}<br>
                 <b>Water:</b> {water}<br>
@@ -2076,7 +2269,8 @@ elif page == "🔬 Advanced Analysis":
                 x="PM10",
                 y="TSP",
                 color="Pattern",
-                title="Exploratory Anomaly Screening"
+                title="Exploratory Anomaly Screening",
+                labels={"TSP":"SPM"}
             )
 
             st.plotly_chart(
@@ -2111,7 +2305,7 @@ elif page == "📊 Control Performance":
         if not pm_options or "Location" not in dust.columns:
             light_notice("Dust_Monitoring needs Location and at least one supported PM fraction.", tone="warning")
         else:
-            fraction=st.selectbox("PM fraction for expected performance",pm_options,index=pm_options.index("PM10") if "PM10" in pm_options else 0,key="expected_perf_fraction")
+            fraction=st.selectbox("PM fraction for expected performance",pm_options,index=pm_options.index("PM10") if "PM10" in pm_options else 0,key="expected_perf_fraction",format_func=pm_display_name)
             work=dust.copy(); work[fraction]=pd.to_numeric(work[fraction],errors="coerce")
             work=work.dropna(subset=["Location",fraction])
             if "Activity" in work.columns:
@@ -2144,6 +2338,36 @@ elif page == "📊 Control Performance":
                     reduction_ref=ev.groupby("Device_Type")["Reduction_Percent"].median().to_dict()
             current["Expected_Reduction_Percent"]=current["Recommended_Measure"].map(reduction_ref)
             current["After_Expected_PM"]=current.apply(lambda r:r["Before_Current_PM"]*(1-r["Expected_Reduction_Percent"]/100) if pd.notna(r["Expected_Reduction_Percent"]) else np.nan,axis=1)
+
+            st.subheader("Compliance / Control Target")
+            perf_limit, perf_limit_label = government_reference_limit(fraction)
+            perf_limit = float(perf_limit) if perf_limit is not None else 0.0
+            if perf_limit > 0:
+                st.info(f"Automatic government reference: {perf_limit_label}. The line is applied directly; no manual value is required. Individual/short-interval readings are treated as screening comparisons unless the monitoring basis matches the standard's averaging requirements.")
+            else:
+                st.warning(f"{perf_limit_label}. Automatic compliance-trigger logic is therefore not applied to {pm_display_name(fraction)}.")
+
+            secondary_rules={
+                "Haulage":"Chemical Dust Suppressant",
+                "Crushing":"Fog / Misting System",
+                "Loading":"Water Spray",
+                "Drilling":"Local Water Injection",
+                "Dumping":"Operational Dust Control",
+                "Stockpile":"Chemical Dust Suppressant",
+                "Workshop":"Source-specific engineering assessment"
+            }
+            current["Second_Control"]=current["Activity"].map(secondary_rules)
+            current["Second_Reduction_Percent"]=current["Second_Control"].map(reduction_ref)
+            current["After_Two_Controls_PM"]=np.nan
+            need_second=(perf_limit>0) & current["After_Expected_PM"].notna() & (current["After_Expected_PM"]>perf_limit)
+            can_second=need_second & current["Second_Reduction_Percent"].notna()
+            current.loc[can_second,"After_Two_Controls_PM"] = current.loc[can_second,"After_Expected_PM"] * (1-current.loc[can_second,"Second_Reduction_Percent"]/100.0)
+            current["Control_Status"]="One-control projection available"
+            if perf_limit>0:
+                current.loc[current["After_Expected_PM"].notna() & (current["After_Expected_PM"]<=perf_limit),"Control_Status"]="Projected at/below target after Control 1"
+                current.loc[need_second & current["Second_Reduction_Percent"].isna(),"Control_Status"]="Control 1 insufficient; second control requires verified performance evidence"
+                current.loc[can_second & (current["After_Two_Controls_PM"]<=perf_limit),"Control_Status"]="Projected at/below target after Control 1 + Control 2"
+                current.loc[can_second & (current["After_Two_Controls_PM"]>perf_limit),"Control_Status"]="Two controls still above target — additional engineering/operational intervention required"
             shown=current.dropna(subset=["Expected_Reduction_Percent"]).copy()
             if not len(shown):
                 light_notice("No matching verified control-performance evidence is available in the uploaded raw files. For engineering planning only, you may run an explicitly assumed reduction scenario below; it will not be presented as measured efficiency.",tone="warning")
@@ -2154,21 +2378,39 @@ elif page == "📊 Control Performance":
                     if len(shown):
                         shown["Expected_Reduction_Percent"]=float(assumed_pct)
                         shown["After_Expected_PM"]=shown["Before_Current_PM"]*(1-float(assumed_pct)/100.0)
+                        shown["Second_Control"]=shown["Activity"].map(secondary_rules)
+                        shown["Second_Reduction_Percent"]=np.nan
+                        shown["After_Two_Controls_PM"]=np.nan
+                        shown["Control_Status"]="ASSUMED one-control planning projection"
+                        if perf_limit > 0:
+                            assumed_need_second=shown["After_Expected_PM"]>perf_limit
+                            # In an explicitly assumed scenario, reuse the user's own assumed
+                            # reduction for the compatible second stage. This remains an assumption,
+                            # not measured or certified device efficiency.
+                            assumed_can_second=assumed_need_second & shown["Second_Control"].notna()
+                            shown.loc[assumed_can_second,"Second_Reduction_Percent"]=float(assumed_pct)
+                            shown.loc[assumed_can_second,"After_Two_Controls_PM"]=shown.loc[assumed_can_second,"After_Expected_PM"]*(1-float(assumed_pct)/100.0)
+                            shown.loc[~assumed_need_second,"Control_Status"]="ASSUMED projection at/below target after Control 1"
+                            shown.loc[assumed_can_second & (shown["After_Two_Controls_PM"]<=perf_limit),"Control_Status"]="ASSUMED projection at/below target after Control 1 + Control 2"
+                            shown.loc[assumed_can_second & (shown["After_Two_Controls_PM"]>perf_limit),"Control_Status"]="ASSUMED two-control projection still above target — additional intervention required"
+                            shown.loc[assumed_need_second & ~assumed_can_second,"Control_Status"]="Control 1 insufficient; compatible second control requires engineering selection"
                         shown["Evidence_Basis"]="ASSUMED planning scenario — verify by before/after field measurement"
-                        light_notice(f"Planning scenario active: {assumed_pct}% reduction is an ASSUMED input, not a measured or literature-certified device efficiency.",tone="info")
+                        light_notice(f"Planning scenario active: {assumed_pct}% reduction is a USER-ENTERED ASSUMPTION. If Control 1 remains above the automatic government reference, the same assumed reduction is applied sequentially to the compatible Control 2 for planning only.",tone="info")
                     else:
                         light_notice("Assign verified mining activities in Data & Validation first so source-specific controls can be recommended. Background/community monitoring points are not assigned an arbitrary control efficiency.",tone="info")
             if len(shown):
                 st.subheader("Expected Before → After Performance")
                 st.markdown("**Interpretation:** the ‘Before’ value is the current median PM from the uploaded monitoring data. The ‘After’ value is the expected PM if the recommended measure is implemented under operating conditions comparable to the verified performance evidence.")
-                display=shown[["Location","Activity","Recommended_Measure","Before_Current_PM","Expected_Reduction_Percent","After_Expected_PM"]].copy()
-                display.columns=["Location","Activity","Recommended measure","Before — current PM","Expected reduction (%)","After — expected PM"]
+                display=shown[["Location","Activity","Recommended_Measure","Before_Current_PM","Expected_Reduction_Percent","After_Expected_PM","Second_Control","Second_Reduction_Percent","After_Two_Controls_PM","Control_Status"]].copy()
+                display.columns=["Location","Activity","Control 1","Before — current PM","Control 1 reduction (%)","After Control 1 — expected PM","Control 2 if required","Control 2 reduction (%)","After two controls — expected PM","Assessment"]
                 st.dataframe(display.round(2),use_container_width=True,hide_index=True)
 
-                graph=shown[["Location","Before_Current_PM","After_Expected_PM"]].melt(id_vars="Location",var_name="Condition",value_name="PM")
-                graph["Condition"]=graph["Condition"].map({"Before_Current_PM":"Before — current measured","After_Expected_PM":"After — expected with control"})
-                fig=px.bar(graph,x="Location",y="PM",color="Condition",barmode="group",text_auto=".1f",title=f"{fraction}: Current PM vs Expected PM After Recommended Control")
-                fig.update_layout(yaxis_title=fraction,height=500,legend_title_text="")
+                graph=shown[["Location","Before_Current_PM","After_Expected_PM","After_Two_Controls_PM"]].melt(id_vars="Location",var_name="Condition",value_name="PM").dropna(subset=["PM"])
+                graph["Condition"]=graph["Condition"].map({"Before_Current_PM":"Before — current measured","After_Expected_PM":"After Control 1 — expected","After_Two_Controls_PM":"After Control 1 + 2 — expected"})
+                fig=px.bar(graph,x="Location",y="PM",color="Condition",barmode="group",text_auto=".1f",title=f"{pm_display_name(fraction)}: Current PM vs Expected PM After Recommended Control(s)")
+                fig.update_layout(yaxis_title=pm_display_name(fraction),height=500,legend_title_text="")
+                if perf_limit>0:
+                    fig.add_hline(y=perf_limit,line_color="red",line_width=3,line_dash="dash",annotation_text=f"Applicable limit = {perf_limit:g}",annotation_position="top left")
                 st.plotly_chart(fig,use_container_width=True)
 
                 selected=st.selectbox("View location result",shown["Location"].tolist(),key="expected_location")
@@ -2177,7 +2419,16 @@ elif page == "📊 Control Performance":
                 c1.metric("Before — current PM",f'{rr["Before_Current_PM"]:.2f}')
                 c2.metric("Expected reduction",f'{rr["Expected_Reduction_Percent"]:.1f}%')
                 c3.metric("After — expected PM",f'{rr["After_Expected_PM"]:.2f}')
-                st.markdown(f"**Recommended measure:** {rr['Recommended_Measure']}")
+                st.markdown(f"**Control 1:** {rr['Recommended_Measure']}")
+                if perf_limit>0 and pd.notna(rr["After_Expected_PM"]) and rr["After_Expected_PM"]>perf_limit:
+                    if pd.notna(rr.get("Second_Reduction_Percent", np.nan)):
+                        basis_word = "assumed planning" if str(rr.get("Evidence_Basis", "")).startswith("ASSUMED") else "evidence-based"
+                        st.markdown(f"**Control 2 required:** {rr['Second_Control']} — projected sequentially after Control 1 ({rr['Second_Reduction_Percent']:.1f}% {basis_word} reduction applied to the remaining concentration).")
+                        if pd.notna(rr.get("After_Two_Controls_PM", np.nan)):
+                            st.metric("After Control 1 + 2 — expected PM",f'{rr["After_Two_Controls_PM"]:.2f}')
+                    else:
+                        st.warning(f"Control 1 remains above the automatic government reference. A compatible second control is suggested ({rr['Second_Control']}), but the uploaded evidence does not contain a verified reduction value for it, so the app will not invent a numerical result.")
+                st.markdown(f"**Assessment:** {rr['Control_Status']}")
                 light_notice(f"If {rr['Recommended_Measure']} is implemented at {rr['Location']} under comparable operating conditions, {fraction} is expected to reduce from {rr['Before_Current_PM']:.2f} to approximately {rr['After_Expected_PM']:.2f} ({rr['Expected_Reduction_Percent']:.1f}% expected reduction). This is an engineering estimate, not a measured post-installation result.",tone="success")
 
 elif page == "📚 Technology Library":
@@ -2548,9 +2799,34 @@ elif page == "📄 Project Report":
 
         with st.expander("Report settings", expanded=False):
             if pm_options:
-                report_fraction=st.selectbox("PM fraction",pm_options,index=0,key="compact_report_pm")
+                report_fraction=st.selectbox("PM fraction",pm_options,index=0,key="compact_report_pm",format_func=pm_display_name)
             report_radius=st.slider("Planning coverage radius (m)",10,500,100,10,key="compact_report_radius")
             st.caption("Coverage radius is an assumed planning input, not a verified equipment range.")
+
+        # Reuse the verified seasonal wind selections from Spatial Dust Map in the PDF.
+        report_wind=[]
+        _opp={"N":"S","NE":"SW","E":"W","SE":"NW","S":"N","SW":"NE","W":"E","NW":"SE"}
+        _season_names=["Winter","Pre-monsoon / Summer","Monsoon","Post-monsoon"]
+        _wind_distance=int(st.session_state.get("wind_dispersion_radius",100))
+        for _sn in _season_names:
+            _fd=st.session_state.get(f"wind_{_sn}","Not entered")
+            if _fd in WIND_BEARINGS:
+                report_wind.append({"season":_sn,"from_dir":_fd,"to_dir":_opp[_fd],"to_bearing":(WIND_BEARINGS[_fd]+180)%360,"distance_m":_wind_distance})
+        report_receptors=pd.DataFrame(columns=["Name","Type","Latitude","Longitude"])
+        if sites is not None and len(sites):
+            _latc=next((c for c in ["Latitude","Lat"] if c in sites.columns),None); _lonc=next((c for c in ["Longitude","Lon","Lng"] if c in sites.columns),None)
+            _typec=next((c for c in ["Receptor_Type","Site_Type","Type"] if c in sites.columns),None); _namec=next((c for c in ["Location","Name","Site"] if c in sites.columns),None)
+            if _latc and _lonc:
+                _rows=[]
+                for _,_sr in sites.iterrows():
+                    _typ=str(_sr.get(_typec,"Other")) if _typec else "Other"
+                    if (_typec is None) or any(k in _typ.lower() for k in ["settlement","market","school","hospital","village","residential","receptor"]):
+                        _rows.append({"Name":str(_sr.get(_namec,"Receptor")) if _namec else "Receptor","Type":_typ,"Latitude":_sr.get(_latc,np.nan),"Longitude":_sr.get(_lonc,np.nan)})
+                report_receptors=pd.DataFrame(_rows,columns=["Name","Type","Latitude","Longitude"])
+                if len(report_receptors):
+                    report_receptors["Latitude"]=pd.to_numeric(report_receptors["Latitude"],errors="coerce"); report_receptors["Longitude"]=pd.to_numeric(report_receptors["Longitude"],errors="coerce")
+                    report_receptors=report_receptors.dropna(subset=["Latitude","Longitude"])
+        report_planning_zone=None
 
         report_map_bytes = None  # report map is generated automatically from loaded GPS/control data
 
@@ -2587,6 +2863,16 @@ elif page == "📄 Project Report":
                 engineering_df=pd.DataFrame(rows)
                 plan=engineering_df[['Location','Activity','Primary_Control']].rename(columns={'Primary_Control':'Proposed_Primary_Control'}).merge(report_loc[['Location','Latitude','Longitude']],on='Location',how='left')
                 report_optimized=optimize_shared_control_placement(plan,report_radius)
+                if report_wind:
+                    _lat_span=max(float(report_loc.Latitude.max()-report_loc.Latitude.min()),0.01); _lon_span=max(float(report_loc.Longitude.max()-report_loc.Longitude.min()),0.01)
+                    _lats=np.linspace(float(report_loc.Latitude.min()-0.35*_lat_span),float(report_loc.Latitude.max()+0.35*_lat_span),23); _lons=np.linspace(float(report_loc.Longitude.min()-0.35*_lon_span),float(report_loc.Longitude.max()+0.35*_lon_span),23)
+                    _sc=[]; _bs=[w['to_bearing'] for w in report_wind]
+                    for _la in _lats:
+                        for _lo in _lons:
+                            _score,_meta=planning_score(_la,_lo,report_loc,_bs,report_receptors)
+                            _sc.append((_score,_la,_lo,_meta))
+                    if _sc:
+                        _best=max(_sc,key=lambda x:x[0]); report_planning_zone={"Latitude":_best[1],"Longitude":_best[2],**_best[3]}
 
         # Build expected post-control performance from current uploaded PM + verified control evidence.
         if len(engineering_df):
@@ -2606,18 +2892,18 @@ elif page == "📄 Project Report":
 
         st.markdown("### Engineering Solution Report")
         st.markdown("A concise **2–3 page PDF** designed for project presentation and non-technical reading.")
-        st.markdown("**Includes:** key dust findings • location-wise recommended controls • hotspot/control map • expected reduction and predicted post-control PM • final conclusion")
+        st.markdown("**Includes:** key dust findings • location-wise recommended controls • satellite hotspot/control map • seasonal wind direction and downwind planning distance • preferred lower-exposure settlement/receptor zone • expected control performance • conclusion")
 
         if len(engineering_df):
             top=engineering_df.sort_values('Median_PM',ascending=False).iloc[0]
             c1,c2=st.columns(2)
             c1.metric('Highest-priority location',str(top['Location']))
-            c2.metric(f"Median {report_fraction}",f"{top['Median_PM']:.2f}")
+            c2.metric(f"Median {pm_display_name(report_fraction)}",f"{top['Median_PM']:.2f}")
         else:
             st.warning('A spatial solution map requires valid PM records linked to Location + Latitude + Longitude.')
 
         report_lines=['Compact engineering solution report']
-        pdf_bytes,pdf_error=build_engineering_pdf(report_lines,quality=quality,engineering_df=engineering_df if len(engineering_df) else None,optimized_df=report_optimized,performance_df=pdf_perf,report_loc=report_loc,pm_fraction=report_fraction,planning_radius=report_radius,map_image_bytes=report_map_bytes)
+        pdf_bytes,pdf_error=build_engineering_pdf(report_lines,quality=quality,engineering_df=engineering_df if len(engineering_df) else None,optimized_df=report_optimized,performance_df=pdf_perf,report_loc=report_loc,pm_fraction=report_fraction,planning_radius=report_radius,map_image_bytes=report_map_bytes,wind_summary=report_wind,planning_zone=report_planning_zone,receptors=report_receptors)
         if pdf_bytes:
             st.download_button('📄 Download Engineering Solution Report (PDF)',data=pdf_bytes,file_name='Mine_Dust_Evaluation_Engineering_Report.pdf',mime='application/pdf',type='primary',use_container_width=True)
             light_notice('Report ready for download.', tone='success')
