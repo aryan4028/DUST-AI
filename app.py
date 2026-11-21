@@ -621,17 +621,16 @@ def build_engineering_pdf(report_lines, quality=None, engineering_df=None, optim
                     continue
                 c=colors.get(str(rr.get('Map_Color','orange')).lower(),'#d97706')
                 draw.ellipse((x-9,y-9,x+9,y+9),fill=c,outline='white',width=3)
-                loc=str(rr.get('Location','Site'))
-                ctl=control_lookup.get(loc,'')
-                activity=activity_lookup.get(loc, str(rr.get('Activity','Not recorded')))
-                source_label=f'{activity} dust source' if activity and activity not in ['Not recorded','nan','None'] else 'Monitored dust site'
-                label=f'{loc} | {source_label}' if not ctl else f'{loc} | {source_label} | {ctl}'
-                # Readable white callout behind each label.
-                box=draw.textbbox((0,0),label,font=font)
+                # Keep the PDF satellite map readable: compact site IDs only.
+                # Full Location / Activity / Recommended Control details are listed
+                # in the report table immediately below the map.
+                site_no = list(pts.index).index(rr.name) + 1
+                label=f'S{site_no}'
+                box=draw.textbbox((0,0),label,font=font_b)
                 tw,th=box[2]-box[0],box[3]-box[1]
-                tx=min(max(x+13,4),max(4,width-tw-10)); ty=min(max(y-th//2,4),height-th-8)
-                draw.rounded_rectangle((tx-4,ty-3,tx+tw+4,ty+th+3),radius=4,fill=(255,255,255,225),outline='#cbd5e1')
-                draw.text((tx,ty),label,fill='#111827',font=font)
+                tx=min(max(x+12,4),max(4,width-tw-8)); ty=min(max(y-th//2,4),height-th-6)
+                draw.rounded_rectangle((tx-3,ty-2,tx+tw+3,ty+th+2),radius=4,fill='white',outline=c,width=2)
+                draw.text((tx,ty),label,fill='#111827',font=font_b)
 
             # Seasonal wind / receptor planning overlay for the report.
             if receptors is not None and len(receptors):
@@ -712,7 +711,7 @@ def build_engineering_pdf(report_lines, quality=None, engineering_df=None, optim
         if mb:
             story.append(Image(mb,width=184*mm,height=114*mm))
             story.append(Spacer(1,2*mm))
-            story.append(Paragraph('Monitoring dust sites are labelled with location, dust-generating activity/source and recommended control. Red/orange/green markers show higher/moderate/lower relative dust priority.',styles['RS']))
+            story.append(Paragraph('Dust monitoring sites are marked S1, S2, S3... to keep the satellite map readable. Full site, dust-source/activity and recommended-control details are listed in the table below. Red/orange/green markers show higher/moderate/lower relative dust priority.',styles['RS']))
             if wind_summary:
                 story.append(Spacer(1,3*mm)); story.append(Paragraph('Seasonal wind and settlement/receptor planning',styles['RH']))
                 wind_text=[]
@@ -735,7 +734,7 @@ def build_engineering_pdf(report_lines, quality=None, engineering_df=None, optim
 
     # PAGE 3 — predicted performance after recommended controls
     story.append(PageBreak()); story += [Paragraph('3. Expected control performance and conclusion',styles['RH'])]
-    if performance_df is not None and len(performance_df) and {'Current_PM','Recommended_Control','Expected_Reduction_Percent','Predicted_PM_After_Control'}.issubset(performance_df.columns):
+    if performance_df is not None and len(performance_df) and {'Current_PM','Recommended_Control','Expected_Reduction_Percent','Predicted_PM_After_Control'}.issubset(performance_df.columns) and pd.to_numeric(performance_df['Expected_Reduction_Percent'],errors='coerce').notna().any():
         story.append(Paragraph('Predicted improvement if the recommended controls are implemented',styles['RB']))
         cols=['Location','Current_PM','Recommended_Control','Expected_Reduction_Percent','Predicted_PM_After_Control']
         d=performance_df[cols].dropna(subset=['Expected_Reduction_Percent']).head(8).copy().round(2)
@@ -1535,12 +1534,10 @@ elif page == "📈 Dust Analysis":
                 x_title = "Observation Sequence"
 
             selected = st.multiselect("PM fractions to display", pm_cols, default=[], format_func=pm_display_name)
-            if not selected:
-                selected = pm_cols
 
             c1,c2,c3,c4 = st.columns(4)
             c1.metric("Observations", len(analysis))
-            peak_fraction = "PM10" if "PM10" in pm_cols else selected[0]
+            peak_fraction = "PM10" if "PM10" in pm_cols else pm_cols[0]
             peak_series = analysis[peak_fraction]
             if peak_series.notna().any():
                 peak_idx = peak_series.idxmax()
@@ -1553,40 +1550,43 @@ elif page == "📈 Dust Analysis":
             c4.metric("PM fractions", len(pm_cols))
 
             st.subheader("PM Variation with Time")
-            # Government reference lines are shown automatically when a directly corresponding standard exists.
-            auto_limits=[]
-            for _f in selected:
-                _lim,_lab=government_reference_limit(_f)
-                if _lim is not None and (_lim,_lab) not in auto_limits:
-                    auto_limits.append((_lim,_lab))
-            if auto_limits:
-                st.caption("Red reference line(s) are applied automatically from the configured Indian government standards. Because these standards use specified averaging periods, individual instrument readings are a screening/reference comparison, not by themselves a legal non-compliance determination.")
-            time_id_vars = list(dict.fromkeys([x_col, "Observation", "Time_Label"]))
-            time_long = analysis.melt(id_vars=time_id_vars, value_vars=selected,
-                                      var_name="PM Fraction", value_name="Measured Value")
-            time_long["PM Fraction"] = time_long["PM Fraction"].map(pm_display_name)
-            fig = px.line(time_long, x=x_col, y="Measured Value", color="PM Fraction", markers=True,
-                          title="Particulate Measurements Across the Monitoring Period",
-                          hover_data=["Observation","Time_Label"])
-            fig.update_layout(xaxis_title=x_title, yaxis_title="Measured Value (source unit not verified)")
-            for _lim,_lab in auto_limits:
-                fig.add_hline(y=_lim, line_color="red", line_width=3, line_dash="dash", annotation_text=_lab, annotation_position="top left")
-            if x_col == "_Timestamp":
-                fig.update_xaxes(tickformat="%d %b\n%H:%M")
-            st.plotly_chart(fig, use_container_width=True)
-            st.info("Engineering interpretation: peaks identify monitoring periods requiring field investigation. A peak alone does not establish its source or regulatory exceedance.")
-
-            if "PM10" in analysis.columns:
-                st.subheader("PM10 Focus")
-                fig = px.line(analysis, x=x_col, y="PM10", markers=True, title="PM10 Variation with Time",
+            if not selected:
+                st.info("Select one or more PM fractions above to display the time-series analysis.")
+            else:
+                # Government reference lines are shown automatically only for the selected fractions.
+                auto_limits=[]
+                for _f in selected:
+                    _lim,_lab=government_reference_limit(_f)
+                    if _lim is not None and (_lim,_lab) not in auto_limits:
+                        auto_limits.append((_lim,_lab))
+                if auto_limits:
+                    st.caption("Red reference line(s) are applied automatically from the configured Indian government standards. Because these standards use specified averaging periods, individual instrument readings are a screening/reference comparison, not by themselves a legal non-compliance determination.")
+                time_id_vars = list(dict.fromkeys([x_col, "Observation", "Time_Label"]))
+                time_long = analysis.melt(id_vars=time_id_vars, value_vars=selected,
+                                          var_name="PM Fraction", value_name="Measured Value")
+                time_long["PM Fraction"] = time_long["PM Fraction"].map(pm_display_name)
+                fig = px.line(time_long, x=x_col, y="Measured Value", color="PM Fraction", markers=True,
+                              title="Particulate Measurements Across the Monitoring Period",
                               hover_data=["Observation","Time_Label"])
-                fig.update_layout(xaxis_title=x_title, yaxis_title="PM10 (source unit not verified)")
-                _pm10_lim,_pm10_lab=government_reference_limit("PM10")
-                if _pm10_lim is not None:
-                    fig.add_hline(y=_pm10_lim, line_color="red", line_width=3, line_dash="dash", annotation_text=_pm10_lab, annotation_position="top left")
+                fig.update_layout(xaxis_title=x_title, yaxis_title="Measured Value (source unit not verified)")
+                for _lim,_lab in auto_limits:
+                    fig.add_hline(y=_lim, line_color="red", line_width=3, line_dash="dash", annotation_text=_lab, annotation_position="top left")
                 if x_col == "_Timestamp":
                     fig.update_xaxes(tickformat="%d %b\n%H:%M")
                 st.plotly_chart(fig, use_container_width=True)
+                st.info("Engineering interpretation: peaks identify monitoring periods requiring field investigation. A peak alone does not establish its source or regulatory exceedance.")
+
+                if "PM10" in selected and "PM10" in analysis.columns:
+                    st.subheader("PM10 Focus")
+                    fig = px.line(analysis, x=x_col, y="PM10", markers=True, title="PM10 Variation with Time",
+                                  hover_data=["Observation","Time_Label"])
+                    fig.update_layout(xaxis_title=x_title, yaxis_title="PM10 (source unit not verified)")
+                    _pm10_lim,_pm10_lab=government_reference_limit("PM10")
+                    if _pm10_lim is not None:
+                        fig.add_hline(y=_pm10_lim, line_color="red", line_width=3, line_dash="dash", annotation_text=_pm10_lab, annotation_position="top left")
+                    if x_col == "_Timestamp":
+                        fig.update_xaxes(tickformat="%d %b\n%H:%M")
+                    st.plotly_chart(fig, use_container_width=True)
 
             ratio_cols=[]
             if {"PM2.5","PM10"}.issubset(analysis.columns):
