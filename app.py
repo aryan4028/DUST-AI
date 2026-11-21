@@ -726,48 +726,56 @@ def build_engineering_pdf(report_lines, quality=None, engineering_df=None, optim
         else:
             story.append(Paragraph('Map service was unavailable while this PDF was generated. No substitute coordinate chart has been inserted.',styles['RB']))
         if engineering_df is not None and len(engineering_df):
-            map_controls=engineering_df[['Location','Activity','Primary_Control']].copy().head(9)
-            cdata=[[pdf_cell('Location'),pdf_cell('Dust source / activity'),pdf_cell('Recommended control')]] + [[pdf_cell(v) for v in row] for row in map_controls.astype(str).values.tolist()]
-            ctbl=Table(cdata,colWidths=[55*mm,38*mm,84*mm],repeatRows=1)
+            map_controls=engineering_df[['Location','Activity','Primary_Control']].copy().head(9).reset_index(drop=True)
+            map_controls.insert(0,'Site_ID',[f'S{i+1}' for i in range(len(map_controls))])
+            cdata=[[pdf_cell('ID'),pdf_cell('Location'),pdf_cell('Dust source / activity'),pdf_cell('Recommended control')]] + [[pdf_cell(v) for v in row] for row in map_controls.astype(str).values.tolist()]
+            ctbl=Table(cdata,colWidths=[12*mm,48*mm,36*mm,81*mm],repeatRows=1)
             ctbl.setStyle(TableStyle([('BACKGROUND',(0,0),(-1,0),colors.HexColor('#111827')),('TEXTCOLOR',(0,0),(-1,0),colors.white),('FONTSIZE',(0,0),(-1,-1),7),('LEADING',(0,0),(-1,-1),8.2),('GRID',(0,0),(-1,-1),.25,colors.HexColor('#cbd5e1')),('ROWBACKGROUNDS',(0,1),(-1,-1),[colors.white,colors.HexColor('#f8fafc')]),('VALIGN',(0,0),(-1,-1),'TOP')]))
             story += [Spacer(1,2*mm),ctbl]
 
-    # PAGE 3 — predicted performance after recommended controls
+    # PAGE 3 — control performance is always shown for presentation.
     story.append(PageBreak()); story += [Paragraph('3. Expected control performance and conclusion',styles['RH'])]
-    if performance_df is not None and len(performance_df) and {'Current_PM','Recommended_Control','Expected_Reduction_Percent','Predicted_PM_After_Control'}.issubset(performance_df.columns) and pd.to_numeric(performance_df['Expected_Reduction_Percent'],errors='coerce').notna().any():
-        story.append(Paragraph('Predicted improvement if the recommended controls are implemented',styles['RB']))
-        cols=['Location','Current_PM','Recommended_Control','Expected_Reduction_Percent','Predicted_PM_After_Control']
-        d=performance_df[cols].dropna(subset=['Expected_Reduction_Percent']).head(8).copy().round(2)
-        data=[[pdf_cell('Location'),pdf_cell('Current PM'),pdf_cell('Recommended control'),pdf_cell('Expected reduction %'),pdf_cell('Predicted PM after')]] + [[pdf_cell(v) for v in row] for row in d.astype(str).values.tolist()]
-        tbl=Table(data,colWidths=[28*mm,22*mm,70*mm,28*mm,29*mm],repeatRows=1)
-        tbl.setStyle(TableStyle([('BACKGROUND',(0,0),(-1,0),colors.HexColor('#111827')),('TEXTCOLOR',(0,0),(-1,0),colors.white),('FONTSIZE',(0,0),(-1,-1),6.7),('GRID',(0,0),(-1,-1),.25,colors.HexColor('#cbd5e1')),('VALIGN',(0,0),(-1,-1),'TOP')]))
+    if performance_df is not None and len(performance_df):
+        story.append(Paragraph('Control-performance planning: verified evidence is used where available; otherwise a 50% ASSUMED planning reduction is shown explicitly and must be verified by field before/after measurement.',styles['RB']))
+        d=performance_df.head(8).copy()
+        rows=[]
+        for _,r in d.iterrows():
+            after2=r.get('After_Two_Controls_PM',np.nan)
+            c2=r.get('Second_Control','') if pd.notna(r.get('Second_Control',np.nan)) else ''
+            final_after=after2 if pd.notna(after2) else r.get('Predicted_PM_After_Control',np.nan)
+            control_text=str(r.get('Recommended_Control','')) + ((' + '+str(c2)) if pd.notna(after2) and c2 else '')
+            rows.append([r.get('Location',''),r.get('Current_PM',''),control_text,r.get('Predicted_PM_After_Control',''),final_after,r.get('Applicable_Limit',''),r.get('Evidence_Basis','')])
+        data=[[pdf_cell('Location'),pdf_cell('Current PM'),pdf_cell('Control(s)'),pdf_cell('After C1'),pdf_cell('Final projected'),pdf_cell('Reference'),pdf_cell('Basis')]] + [[pdf_cell(v) for v in row] for row in rows]
+        tbl=Table(data,colWidths=[30*mm,18*mm,47*mm,18*mm,22*mm,18*mm,34*mm],repeatRows=1)
+        tbl.setStyle(TableStyle([('BACKGROUND',(0,0),(-1,0),colors.HexColor('#111827')),('TEXTCOLOR',(0,0),(-1,0),colors.white),('FONTSIZE',(0,0),(-1,-1),6.1),('LEADING',(0,0),(-1,-1),7.2),('GRID',(0,0),(-1,-1),.25,colors.HexColor('#cbd5e1')),('VALIGN',(0,0),(-1,-1),'TOP'),('ROWBACKGROUNDS',(0,1),(-1,-1),[colors.white,colors.HexColor('#f8fafc')])]))
         story += [tbl,Spacer(1,2*mm)]
-        # Compact Before-vs-Expected-After graph for the report.
         try:
             from PIL import Image as PILImage, ImageDraw, ImageFont
             chart=PILImage.new('RGB',(1050,330),'white'); dr=ImageDraw.Draw(chart)
-            try:
-                fnt=ImageFont.truetype('DejaVuSans.ttf',14); fntb=ImageFont.truetype('DejaVuSans-Bold.ttf',15)
-            except Exception: fnt=fntb=ImageFont.load_default()
-            maxv=max(float(d['Current_PM'].max()),1.0); left,top,bottom=65,25,275; usable=bottom-top
-            n=max(len(d),1); groupw=(1000-left)/n
+            try: fnt=ImageFont.truetype('DejaVuSans.ttf',13)
+            except Exception: fnt=ImageFont.load_default()
+            vals=[]
+            for _,r in d.iterrows():
+                vals += [float(r['Current_PM']),float(r['Predicted_PM_After_Control'])]
+                if pd.notna(r.get('After_Two_Controls_PM',np.nan)): vals.append(float(r['After_Two_Controls_PM']))
+            lim=pd.to_numeric(d.get('Applicable_Limit'),errors='coerce').dropna() if 'Applicable_Limit' in d else pd.Series(dtype=float)
+            if len(lim): vals.append(float(lim.iloc[0]))
+            maxv=max(vals+[1.0]); left,top,bottom=65,25,275; usable=bottom-top; n=max(len(d),1); groupw=(970-left)/n
             dr.line((left,top,left,bottom),fill='#64748b',width=2); dr.line((left,bottom,1025,bottom),fill='#64748b',width=2)
-            for i,(_,rr) in enumerate(d.iterrows()):
-                x=left+i*groupw+8; bw=max(12,int(groupw*.27))
-                bv=float(rr['Current_PM']); av=float(rr['Predicted_PM_After_Control'])
-                bh=usable*bv/maxv; ah=usable*av/maxv
-                dr.rectangle((x,bottom-bh,x+bw,bottom),fill='#475569')
-                dr.rectangle((x+bw+5,bottom-ah,x+2*bw+5,bottom),fill='#d97706')
-                lab=str(rr['Location'])[:16]; dr.text((x,bottom+8),lab,fill='#111827',font=fnt)
-            dr.rectangle((720,8,735,23),fill='#475569'); dr.text((741,6),'Before — current PM',fill='#111827',font=fnt)
-            dr.rectangle((870,8,885,23),fill='#d97706'); dr.text((891,6),'After — expected',fill='#111827',font=fnt)
-            cb=io.BytesIO(); chart.save(cb,format='PNG'); cb.seek(0)
-            story += [Image(cb,width=178*mm,height=56*mm),Spacer(1,2*mm)]
-        except Exception:
-            pass
-        story += [Paragraph('If the recommended measures are implemented under operating conditions comparable to the verified performance evidence, the “After” values are the expected PM levels. Expected reduction is derived from the median reduction of verified paired tests for the same control. These are engineering estimates, not measured post-installation results.',styles['RS'])]
+            if len(lim):
+                y=bottom-usable*float(lim.iloc[0])/maxv; dr.line((left,y,1025,y),fill='#dc2626',width=3); dr.text((70,max(2,y-18)),f'Reference {float(lim.iloc[0]):g}',fill='#dc2626',font=fnt)
+            for i,(_,r) in enumerate(d.iterrows()):
+                x=left+i*groupw+6; bw=max(8,int(groupw*.18)); series=[float(r['Current_PM']),float(r['Predicted_PM_After_Control'])]
+                if pd.notna(r.get('After_Two_Controls_PM',np.nan)): series.append(float(r['After_Two_Controls_PM']))
+                fills=['#475569','#d97706','#16a34a']
+                for j,v in enumerate(series):
+                    h=usable*v/maxv; xx=x+j*(bw+3); dr.rectangle((xx,bottom-h,xx+bw,bottom),fill=fills[j])
+                dr.text((x,bottom+7),str(r['Location'])[:12],fill='#111827',font=fnt)
+            cb=io.BytesIO(); chart.save(cb,format='PNG'); cb.seek(0); story += [Image(cb,width=178*mm,height=56*mm),Spacer(1,2*mm)]
+        except Exception: pass
+        story.append(Paragraph('C1 = primary recommended control. C2 is added only when the Control 1 projection remains above the configured government/reference target. Projected/assumed values are planning estimates, not measured post-installation results.',styles['RS']))
     else:
-        story.append(Paragraph('No matching verified control-performance evidence is available to estimate post-control PM; no reduction percentage has been invented.',styles['RB']))
+        story.append(Paragraph('Control-performance planning could not be calculated because no location-wise PM/control rows were available.',styles['RB']))
     story.append(Paragraph('Final conclusion',styles['RH']))
     if engineering_df is not None and len(engineering_df):
         ranked=engineering_df.sort_values('Median_PM',ascending=False)
@@ -2887,7 +2895,21 @@ elif page == "📄 Project Report":
                     perf['Reduction_Percent']=(perf['Before_PM']-perf['After_PM'])/perf['Before_PM']*100
                     reduction_ref=perf.groupby('Device_Type')['Reduction_Percent'].median().to_dict()
             expected['Expected_Reduction_Percent']=expected['Recommended_Control'].map(reduction_ref)
-            expected['Predicted_PM_After_Control']=expected.apply(lambda r:r['Current_PM']*(1-r['Expected_Reduction_Percent']/100) if pd.notna(r['Expected_Reduction_Percent']) else np.nan,axis=1)
+            expected['Evidence_Basis']=np.where(expected['Expected_Reduction_Percent'].notna(),'VERIFIED paired before/after evidence','ASSUMED planning scenario (50%)')
+            expected['Expected_Reduction_Percent']=expected['Expected_Reduction_Percent'].fillna(50.0)
+            expected['Predicted_PM_After_Control']=expected['Current_PM']*(1-expected['Expected_Reduction_Percent']/100.0)
+            limit_value, limit_label = government_reference_limit(report_fraction)
+            expected['Applicable_Limit']=limit_value if limit_value is not None else np.nan
+            secondary_rules={'Haulage':'Chemical Dust Suppressant','Crushing':'Fog / Misting System','Loading':'Water Spray','Drilling':'Local Water Injection','Dumping':'Operational Dust Control','Stockpile':'Chemical Dust Suppressant','Workshop':'Source-specific engineering assessment'}
+            expected['Second_Control']=engineering_df['Activity'].map(secondary_rules).values
+            expected['After_Two_Controls_PM']=np.nan
+            expected['Control_Status']='Projected after Control 1'
+            if limit_value is not None:
+                need2=expected['Predicted_PM_After_Control']>float(limit_value)
+                expected.loc[need2,'After_Two_Controls_PM']=expected.loc[need2,'Predicted_PM_After_Control']*(1-expected.loc[need2,'Expected_Reduction_Percent']/100.0)
+                expected.loc[~need2,'Control_Status']='Projected at/below reference after Control 1'
+                expected.loc[need2 & (expected['After_Two_Controls_PM']<=float(limit_value)),'Control_Status']='Projected at/below reference after Control 1 + Control 2'
+                expected.loc[need2 & (expected['After_Two_Controls_PM']>float(limit_value)),'Control_Status']='Two controls still above reference — additional intervention required'
             pdf_perf=expected
 
         st.markdown("### Engineering Solution Report")
