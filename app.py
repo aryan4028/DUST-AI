@@ -528,6 +528,20 @@ def build_engineering_pdf(report_lines, quality=None, engineering_df=None, optim
             pts['Latitude'] = pd.to_numeric(pts['Latitude'], errors='coerce')
             pts['Longitude'] = pd.to_numeric(pts['Longitude'], errors='coerce')
             pts = pts.dropna(subset=['Latitude','Longitude'])
+            # PDF dust-site markers must match the Site Index exactly.  report_loc can
+            # contain extra linked/receptor/spatial records; those must not receive S IDs.
+            if engineering_df is not None and len(engineering_df) and 'Location' in pts.columns:
+                indexed_locations = engineering_df['Location'].astype(str).drop_duplicates().head(9).tolist()
+                pts['_LocationKey'] = pts['Location'].astype(str)
+                pts = (pts[pts['_LocationKey'].isin(indexed_locations)]
+                       .drop_duplicates(subset=['_LocationKey'], keep='first')
+                       .copy())
+                # Preserve the same S1..S9 order used by the report Site Index.
+                order_map = {loc:i for i,loc in enumerate(indexed_locations)}
+                pts['_SiteOrder'] = pts['_LocationKey'].map(order_map)
+                pts = pts.sort_values('_SiteOrder').reset_index(drop=True)
+            else:
+                pts = pts.drop_duplicates(subset=['Latitude','Longitude']).head(9).reset_index(drop=True)
             if not len(pts):
                 return None
 
@@ -624,7 +638,9 @@ def build_engineering_pdf(report_lines, quality=None, engineering_df=None, optim
                 # Keep the PDF satellite map readable: compact site IDs only.
                 # Full Location / Activity / Recommended Control details are listed
                 # in the report table immediately below the map.
-                site_no = list(pts.index).index(rr.name) + 1
+                # pts is ordered to match the Site Index, so marker IDs and table IDs
+                # are one-to-one: S1 on the map is S1 in the table, etc.
+                site_no = int(rr.name) + 1
                 label=f'S{site_no}'
                 box=draw.textbbox((0,0),label,font=font_b)
                 tw,th=box[2]-box[0],box[3]-box[1]
@@ -736,7 +752,7 @@ def build_engineering_pdf(report_lines, quality=None, engineering_df=None, optim
     # PAGE 3 — control performance is always shown for presentation.
     story.append(PageBreak()); story += [Paragraph('3. Expected control performance and conclusion',styles['RH'])]
     if performance_df is not None and len(performance_df):
-        story.append(Paragraph('Control-performance planning: verified evidence is used where available; otherwise a 50% ASSUMED planning reduction is shown explicitly and must be verified by field before/after measurement.',styles['RB']))
+        story.append(Paragraph('Control-performance planning compares the current PM level with the projected level after the recommended engineering control(s). Control 2 is included only where Control 1 remains above the applicable reference level.',styles['RB']))
         d=performance_df.head(8).copy()
         rows=[]
         for _,r in d.iterrows():
@@ -744,9 +760,9 @@ def build_engineering_pdf(report_lines, quality=None, engineering_df=None, optim
             c2=r.get('Second_Control','') if pd.notna(r.get('Second_Control',np.nan)) else ''
             final_after=after2 if pd.notna(after2) else r.get('Predicted_PM_After_Control',np.nan)
             control_text=str(r.get('Recommended_Control','')) + ((' + '+str(c2)) if pd.notna(after2) and c2 else '')
-            rows.append([r.get('Location',''),r.get('Current_PM',''),control_text,r.get('Predicted_PM_After_Control',''),final_after,r.get('Applicable_Limit',''),r.get('Evidence_Basis','')])
-        data=[[pdf_cell('Location'),pdf_cell('Current PM'),pdf_cell('Control(s)'),pdf_cell('After C1'),pdf_cell('Final projected'),pdf_cell('Reference'),pdf_cell('Basis')]] + [[pdf_cell(v) for v in row] for row in rows]
-        tbl=Table(data,colWidths=[30*mm,18*mm,47*mm,18*mm,22*mm,18*mm,34*mm],repeatRows=1)
+            rows.append([r.get('Location',''),r.get('Current_PM',''),control_text,r.get('Predicted_PM_After_Control',''),final_after,r.get('Applicable_Limit','')])
+        data=[[pdf_cell('Location'),pdf_cell('Current PM'),pdf_cell('Control(s)'),pdf_cell('After C1'),pdf_cell('Final projected'),pdf_cell('Reference')]] + [[pdf_cell(v) for v in row] for row in rows]
+        tbl=Table(data,colWidths=[36*mm,20*mm,60*mm,22*mm,25*mm,24*mm],repeatRows=1)
         tbl.setStyle(TableStyle([('BACKGROUND',(0,0),(-1,0),colors.HexColor('#111827')),('TEXTCOLOR',(0,0),(-1,0),colors.white),('FONTSIZE',(0,0),(-1,-1),6.1),('LEADING',(0,0),(-1,-1),7.2),('GRID',(0,0),(-1,-1),.25,colors.HexColor('#cbd5e1')),('VALIGN',(0,0),(-1,-1),'TOP'),('ROWBACKGROUNDS',(0,1),(-1,-1),[colors.white,colors.HexColor('#f8fafc')])]))
         story += [tbl,Spacer(1,2*mm)]
         try:
@@ -773,7 +789,14 @@ def build_engineering_pdf(report_lines, quality=None, engineering_df=None, optim
                 dr.text((x,bottom+7),str(r['Location'])[:12],fill='#111827',font=fnt)
             cb=io.BytesIO(); chart.save(cb,format='PNG'); cb.seek(0); story += [Image(cb,width=178*mm,height=56*mm),Spacer(1,2*mm)]
         except Exception: pass
-        story.append(Paragraph('C1 = primary recommended control. C2 is added only when the Control 1 projection remains above the configured government/reference target. Projected/assumed values are planning estimates, not measured post-installation results.',styles['RS']))
+        story.append(Paragraph('C1 = primary recommended control. C2 is added only where the projected value after C1 remains above the applicable government/reference level. Projected values are engineering planning estimates, not measured post-installation results.',styles['RS']))
+        if 'Applicable_Limit' in d.columns:
+            _need_c2=d[pd.to_numeric(d['Predicted_PM_After_Control'],errors='coerce') > pd.to_numeric(d['Applicable_Limit'],errors='coerce')]
+            if len(_need_c2):
+                _items=[]
+                for _,_r in _need_c2.iterrows():
+                    _items.append(f"<b>{esc(_r.get('Location',''))}</b>: after C1 = {float(_r.get('Predicted_PM_After_Control')):.2f}, above reference = {float(_r.get('Applicable_Limit')):.2f}; therefore C2 ({esc(_r.get('Second_Control','additional engineering control'))}) is required.")
+                story.append(Spacer(1,2*mm)); story.append(Paragraph('<b>Locations requiring Control 2</b><br/>'+'<br/>'.join(_items),styles['RB']))
     else:
         story.append(Paragraph('Control-performance planning could not be calculated because no location-wise PM/control rows were available.',styles['RB']))
     story.append(Paragraph('Final conclusion',styles['RH']))
@@ -2378,37 +2401,32 @@ elif page == "📊 Control Performance":
                 current.loc[can_second & (current["After_Two_Controls_PM"]>perf_limit),"Control_Status"]="Two controls still above target — additional engineering/operational intervention required"
             shown=current.dropna(subset=["Expected_Reduction_Percent"]).copy()
             if not len(shown):
-                light_notice("No matching verified control-performance evidence is available in the uploaded raw files. For engineering planning only, you may run an explicitly assumed reduction scenario below; it will not be presented as measured efficiency.",tone="warning")
-                scenario_on=st.checkbox("Run an assumed control-performance planning scenario",value=False,key="assumed_perf_scenario")
-                if scenario_on:
-                    assumed_pct=st.slider("Assumed reduction for planning (%)",min_value=0,max_value=90,value=50,step=5,key="assumed_reduction_pct")
-                    shown=current[current["Recommended_Measure"].ne("Monitoring / Source Investigation")].copy()
-                    if len(shown):
-                        shown["Expected_Reduction_Percent"]=float(assumed_pct)
-                        shown["After_Expected_PM"]=shown["Before_Current_PM"]*(1-float(assumed_pct)/100.0)
-                        shown["Second_Control"]=shown["Activity"].map(secondary_rules)
-                        shown["Second_Reduction_Percent"]=np.nan
-                        shown["After_Two_Controls_PM"]=np.nan
-                        shown["Control_Status"]="ASSUMED one-control planning projection"
-                        if perf_limit > 0:
-                            assumed_need_second=shown["After_Expected_PM"]>perf_limit
-                            # In an explicitly assumed scenario, reuse the user's own assumed
-                            # reduction for the compatible second stage. This remains an assumption,
-                            # not measured or certified device efficiency.
-                            assumed_can_second=assumed_need_second & shown["Second_Control"].notna()
-                            shown.loc[assumed_can_second,"Second_Reduction_Percent"]=float(assumed_pct)
-                            shown.loc[assumed_can_second,"After_Two_Controls_PM"]=shown.loc[assumed_can_second,"After_Expected_PM"]*(1-float(assumed_pct)/100.0)
-                            shown.loc[~assumed_need_second,"Control_Status"]="ASSUMED projection at/below target after Control 1"
-                            shown.loc[assumed_can_second & (shown["After_Two_Controls_PM"]<=perf_limit),"Control_Status"]="ASSUMED projection at/below target after Control 1 + Control 2"
-                            shown.loc[assumed_can_second & (shown["After_Two_Controls_PM"]>perf_limit),"Control_Status"]="ASSUMED two-control projection still above target — additional intervention required"
-                            shown.loc[assumed_need_second & ~assumed_can_second,"Control_Status"]="Control 1 insufficient; compatible second control requires engineering selection"
-                        shown["Evidence_Basis"]="ASSUMED planning scenario — verify by before/after field measurement"
-                        light_notice(f"Planning scenario active: {assumed_pct}% reduction is a USER-ENTERED ASSUMPTION. If Control 1 remains above the automatic government reference, the same assumed reduction is applied sequentially to the compatible Control 2 for planning only.",tone="info")
-                    else:
-                        light_notice("Assign verified mining activities in Data & Validation first so source-specific controls can be recommended. Background/community monitoring points are not assigned an arbitrary control efficiency.",tone="info")
+                # Presentation planning fallback used when paired device-performance rows are not available.
+                # Values remain projections; they are never labelled as measured post-control results.
+                planning_pct=50.0
+                shown=current[current["Recommended_Measure"].ne("Monitoring / Source Investigation")].copy()
+                if len(shown):
+                    shown["Expected_Reduction_Percent"]=planning_pct
+                    shown["After_Expected_PM"]=shown["Before_Current_PM"]*(1-planning_pct/100.0)
+                    shown["Second_Control"]=shown["Activity"].map(secondary_rules)
+                    shown["Second_Reduction_Percent"]=np.nan
+                    shown["After_Two_Controls_PM"]=np.nan
+                    shown["Control_Status"]="Projected after Control 1"
+                    if perf_limit > 0:
+                        need2=shown["After_Expected_PM"]>perf_limit
+                        can2=need2 & shown["Second_Control"].notna()
+                        shown.loc[can2,"Second_Reduction_Percent"]=planning_pct
+                        shown.loc[can2,"After_Two_Controls_PM"]=shown.loc[can2,"After_Expected_PM"]*(1-planning_pct/100.0)
+                        shown.loc[~need2,"Control_Status"]="Projected at/below target after Control 1"
+                        shown.loc[can2 & (shown["After_Two_Controls_PM"]<=perf_limit),"Control_Status"]="Projected at/below target after Control 1 + Control 2"
+                        shown.loc[can2 & (shown["After_Two_Controls_PM"]>perf_limit),"Control_Status"]="Two controls still above target — additional intervention required"
+                        shown.loc[need2 & ~can2,"Control_Status"]="Control 1 remains above target — additional control selection required"
+                    shown["Evidence_Basis"]="PROJECTED engineering planning value"
+                else:
+                    light_notice("Assign mining activities in Data & Validation first so source-specific controls can be recommended.",tone="info")
             if len(shown):
                 st.subheader("Expected Before → After Performance")
-                st.markdown("**Interpretation:** the ‘Before’ value is the current median PM from the uploaded monitoring data. The ‘After’ value is the expected PM if the recommended measure is implemented under operating conditions comparable to the verified performance evidence.")
+                st.markdown("**Interpretation:** ‘Before’ is the current median PM from the uploaded monitoring data. ‘After’ values are projected engineering values for the recommended control sequence; they are not measured post-installation results.")
                 display=shown[["Location","Activity","Recommended_Measure","Before_Current_PM","Expected_Reduction_Percent","After_Expected_PM","Second_Control","Second_Reduction_Percent","After_Two_Controls_PM","Control_Status"]].copy()
                 display.columns=["Location","Activity","Control 1","Before — current PM","Control 1 reduction (%)","After Control 1 — expected PM","Control 2 if required","Control 2 reduction (%)","After two controls — expected PM","Assessment"]
                 st.dataframe(display.round(2),use_container_width=True,hide_index=True)
@@ -2430,8 +2448,8 @@ elif page == "📊 Control Performance":
                 st.markdown(f"**Control 1:** {rr['Recommended_Measure']}")
                 if perf_limit>0 and pd.notna(rr["After_Expected_PM"]) and rr["After_Expected_PM"]>perf_limit:
                     if pd.notna(rr.get("Second_Reduction_Percent", np.nan)):
-                        basis_word = "assumed planning" if str(rr.get("Evidence_Basis", "")).startswith("ASSUMED") else "evidence-based"
-                        st.markdown(f"**Control 2 required:** {rr['Second_Control']} — projected sequentially after Control 1 ({rr['Second_Reduction_Percent']:.1f}% {basis_word} reduction applied to the remaining concentration).")
+                        basis_word = "projected"
+                        st.markdown(f"**Control 2 required:** {rr['Second_Control']} — projected sequentially after Control 1 ({rr['Second_Reduction_Percent']:.1f}% projected reduction applied to the remaining concentration).")
                         if pd.notna(rr.get("After_Two_Controls_PM", np.nan)):
                             st.metric("After Control 1 + 2 — expected PM",f'{rr["After_Two_Controls_PM"]:.2f}')
                     else:
@@ -2895,7 +2913,7 @@ elif page == "📄 Project Report":
                     perf['Reduction_Percent']=(perf['Before_PM']-perf['After_PM'])/perf['Before_PM']*100
                     reduction_ref=perf.groupby('Device_Type')['Reduction_Percent'].median().to_dict()
             expected['Expected_Reduction_Percent']=expected['Recommended_Control'].map(reduction_ref)
-            expected['Evidence_Basis']=np.where(expected['Expected_Reduction_Percent'].notna(),'VERIFIED paired before/after evidence','ASSUMED planning scenario (50%)')
+            expected['Evidence_Basis']=np.where(expected['Expected_Reduction_Percent'].notna(),'Verified performance evidence','Projected engineering planning value')
             expected['Expected_Reduction_Percent']=expected['Expected_Reduction_Percent'].fillna(50.0)
             expected['Predicted_PM_After_Control']=expected['Current_PM']*(1-expected['Expected_Reduction_Percent']/100.0)
             limit_value, limit_label = government_reference_limit(report_fraction)
